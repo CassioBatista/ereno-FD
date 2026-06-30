@@ -1,16 +1,23 @@
-"""ERENO-FD — Federated IDS entry point.
+"""ERENO-FD-SF — Federated IDS com Seleção de Features (GRASP antes da federação).
+
+Fluxo:
+  1. GRASP roda centralizado no dataset completo → seleciona subconjunto de features
+  2. Dataset é filtrado pelas features selecionadas
+  3. Dataset filtrado é particionado entre N clientes
+  4. Clientes treinam localmente; servidor agrega (ensemble ou federated_nb)
 
 Usage:
-    python main_fd.py <strategy> <classifier_idx> <dataset_name> [<num_clients>]
+    python main_fd.py <strategy> <grasp_method> <classifier_idx> <dataset_name> [<num_clients>]
 
     strategy       : ensemble | federated_nb
+    grasp_method   : GR-G-BF | GR-G-VND | GR-G-RVND | F-G-VND | F-G-RVND | I-G-VND
     classifier_idx : 1=RandomTree  2=J48  3=REPTree  4=NaiveBayes  5=RandomForest
-    dataset_name   : ARFF file without .csv  (e.g. all_in_one_wsn)
-    num_clients    : number of federated clients  (default: 3)
+    dataset_name   : ARFF sem .csv  (ex: all_in_one_wsn)
+    num_clients    : clientes federados  (default: 3)
 
-Examples:
-    python main_fd.py ensemble      2 all_in_one_wsn 3
-    python main_fd.py federated_nb  4 all_in_one_wsn 5
+Exemplos:
+    python main_fd.py ensemble      GR-G-VND 2 all_in_one_wsn 3
+    python main_fd.py federated_nb  GR-G-VND 4 all_in_one_wsn 5
 """
 
 import sys
@@ -33,17 +40,91 @@ from fd.strategy.federated_nb import FederatedNBStrategy
 from fd.model import nb_to_params, serialize_model
 
 
+# ── feature-subset helper (replicado de main.py) ──────────────────────────
+
+def _get_feature_subsets(dataset_name: str):
+    name = dataset_name.lower()
+    if "wsn" in name:
+        from python.feature_subsets.wsn import WsnFeatures
+        return WsnFeatures()
+    elif "kdd" in name:
+        from python.feature_subsets.kdd import KddFeatures
+        return KddFeatures()
+    elif "cicids" in name:
+        from python.feature_subsets.cicids import CicidsFeatures
+        return CicidsFeatures()
+    elif "swat" in name:
+        from python.feature_subsets.swat import SWATFeatures
+        return SWATFeatures()
+    else:
+        sys.exit(f"Dataset inválido '{dataset_name}'. Use: wsn, kdd, cicids ou swat.")
+
+
+# ── GRASP centralizado ─────────────────────────────────────────────────────
+
+def run_grasp(grasp_method: str, clf_idx: int, dataset_name: str) -> list[int]:
+    """Executa GRASP no dataset completo e retorna os índices de features selecionados."""
+
+    feature_subsets = _get_feature_subsets(dataset_name)
+    config.DATASET  = f"{dataset_name}.csv"
+    config.FOLDS    = 5
+
+    match grasp_method:
+        case "GR-G-BF":
+            from python.grasp.simple import GraspSimple
+            grasp = GraspSimple()
+            grasp.setup_grasp_microservice(clf_idx)
+            best = grasp.run(feature_subsets.RCL_GR, grasp_method, "BIT_FLIP", dataset_name)
+
+        case "GR-G-VND":
+            from python.grasp.vnd import GraspVND
+            grasp = GraspVND()
+            grasp.setup_grasp_microservice(clf_idx)
+            best = grasp.run(feature_subsets.RCL_GR, grasp_method, dataset_name)
+
+        case "GR-G-RVND":
+            from python.grasp.rvnd import GraspRVND
+            grasp = GraspRVND()
+            grasp.setup_grasp_microservice(clf_idx)
+            best = grasp.run(feature_subsets.RCL_GR, grasp_method, dataset_name)
+
+        case "F-G-VND":
+            from python.grasp.vnd import GraspVND
+            grasp = GraspVND()
+            grasp.setup_grasp_microservice(clf_idx)
+            best = grasp.run(feature_subsets.RCL_FULL, grasp_method, dataset_name)
+
+        case "F-G-RVND":
+            from python.grasp.rvnd import GraspRVND
+            grasp = GraspRVND()
+            grasp.setup_grasp_microservice(clf_idx)
+            best = grasp.run(feature_subsets.RCL_FULL, grasp_method, dataset_name)
+
+        case "I-G-VND":
+            from python.grasp.vnd import GraspVND
+            grasp = GraspVND()
+            grasp.setup_grasp_microservice(clf_idx)
+            best = grasp.run(feature_subsets.RCL_I[clf_idx], grasp_method, dataset_name)
+
+        case _:
+            sys.exit(f"Método GRASP inválido: {grasp_method}. "
+                     f"Opções: {config.GRASP_METHOD}")
+
+    return best.get_array_features()
+
+
 # ── main ───────────────────────────────────────────────────────────────────
 
 def main():
-    if len(sys.argv) < 4:
+    if len(sys.argv) < 5:
         print(__doc__)
         sys.exit(1)
 
     strategy_name = sys.argv[1].lower()
-    clf_idx       = int(sys.argv[2]) - 1   # 0-based index into all_classifiers
-    dataset_name  = sys.argv[3]
-    num_clients   = int(sys.argv[4]) if len(sys.argv) > 4 else 3
+    grasp_method  = sys.argv[2]
+    clf_idx       = int(sys.argv[3]) - 1   # 0-based index into all_classifiers
+    dataset_name  = sys.argv[4]
+    num_clients   = int(sys.argv[5]) if len(sys.argv) > 5 else 3
 
     dataset_path  = f"{dataset_name}.csv"
     if not os.path.exists(dataset_path):
@@ -52,28 +133,7 @@ def main():
     clf_ext  = all_classifiers[clf_idx]
     base_clf = clf_ext.get_classifier()
 
-    # ── load & partition ──────────────────────────────────────────────────
-    X_all, y_all, _ = util.load_arff(dataset_path)
-
-    partitions, _, _ = load_and_partition(
-        dataset_path, list(range(1, X_all.shape[1] + 1)),
-        num_clients, seed=config.EVALUATION_SEED,
-    )
-
-    # Global 80/20 train/test split (same data seen by both runs)
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        X_all, y_all, test_size=0.2, random_state=config.EVALUATION_SEED, stratify=y_all
-    )
-
-    # Per-client 80/20 splits
-    client_splits: list[tuple] = []
-    for X_c, y_c in partitions:
-        X_ctr, X_cte, y_ctr, y_cte = train_test_split(
-            X_c, y_c, test_size=0.2, random_state=config.EVALUATION_SEED
-        )
-        client_splits.append((X_ctr, y_ctr, X_cte, y_cte))
-
-    # ── validate federated_nb ─────────────────────────────────────────────
+    # ── validar federated_nb ──────────────────────────────────────────────
     if strategy_name == "federated_nb":
         from sklearn.naive_bayes import GaussianNB
         if not isinstance(base_clf, GaussianNB):
@@ -84,7 +144,47 @@ def main():
             )
             base_clf = GaussianNB()
 
-    # ── build strategy ────────────────────────────────────────────────────
+    # ── PASSO 1: GRASP — seleção de features centralizada ─────────────────
+    print(f"\n{'='*60}")
+    print(f"  ERENO-FD-SF")
+    print(f"  PASSO 1 — Seleção de Features (GRASP centralizado)")
+    print(f"  método GRASP : {grasp_method}")
+    print(f"  classificador: {clf_ext.get_classifier_name()}")
+    print(f"  dataset      : {dataset_name}")
+    print(f"{'='*60}\n")
+
+    selected_features = run_grasp(grasp_method, clf_idx, dataset_name)
+
+    print(f"\n  Features selecionadas ({len(selected_features)}): {sorted(selected_features)}")
+
+    # ── PASSO 2: filtrar dataset e particionar ────────────────────────────
+    print(f"\n{'='*60}")
+    print(f"  PASSO 2 — Particionamento ({num_clients} clientes)")
+    print(f"{'='*60}\n")
+
+    partitions, X_filtered, y_all = load_and_partition(
+        dataset_path, selected_features, num_clients, seed=config.EVALUATION_SEED,
+    )
+
+    # Split global 80/20 (mesmo dado visto nas duas comparações)
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        X_filtered, y_all,
+        test_size=0.2, random_state=config.EVALUATION_SEED, stratify=y_all,
+    )
+
+    # Splits por cliente
+    client_splits: list[tuple] = []
+    for X_c, y_c in partitions:
+        X_ctr, X_cte, y_ctr, y_cte = train_test_split(
+            X_c, y_c, test_size=0.2, random_state=config.EVALUATION_SEED,
+        )
+        client_splits.append((X_ctr, y_ctr, X_cte, y_cte))
+
+    # ── PASSO 3: federated learning ───────────────────────────────────────
+    print(f"\n{'='*60}")
+    print(f"  PASSO 3 — Aprendizado Federado (estratégia: {strategy_name})")
+    print(f"{'='*60}\n")
+
     fit_config = {"mode": strategy_name}
 
     match strategy_name:
@@ -115,15 +215,6 @@ def main():
         X_ctr, y_ctr, X_cte, y_cte = client_splits[i]
         return ErenoClient(i, X_ctr, y_ctr, X_cte, y_cte, base_clf).to_client()
 
-    # ── simulation ────────────────────────────────────────────────────────
-    print(f"\n{'='*60}")
-    print(f"  ERENO-FD")
-    print(f"  estratégia  : {strategy_name}")
-    print(f"  clientes    : {num_clients}")
-    print(f"  classificador: {clf_ext.get_classifier_name()}")
-    print(f"  dataset     : {dataset_name}")
-    print(f"{'='*60}\n")
-
     fl.simulation.start_simulation(
         client_fn=client_fn,
         num_clients=num_clients,
@@ -131,9 +222,10 @@ def main():
         strategy=strategy,
     )
 
-    # ── evaluate global federated model ───────────────────────────────────
+    # ── avaliação ─────────────────────────────────────────────────────────
     print(f"\n{'='*60}")
-    print("  Avaliação no conjunto de teste global (80/20 split)")
+    print("  Avaliação no conjunto de teste global")
+    print(f"  features usadas: {len(selected_features)} de {X_filtered.shape[1] + len(selected_features) - X_filtered.shape[1]}")
     print(f"{'='*60}")
 
     match strategy_name:
@@ -142,19 +234,19 @@ def main():
             if global_model is None:
                 sys.exit("Agregação falhou — nenhum modelo global disponível.")
             r_fed = evaluate_model(global_model, X_te, y_te, "FederatedNB")
-            fed_label = "FEDERADO (NaiveBayes exato)"
+            fed_label = "FEDERADO-SF (NaiveBayes exato)"
         case _:
             y_pred = strategy.majority_vote_predict(X_te)
             r_fed  = evaluate_predictions("Ensemble", y_te, y_pred)
-            fed_label = f"FEDERADO (Ensemble c/ {num_clients} clientes)"
+            fed_label = f"FEDERADO-SF (Ensemble, {num_clients} clientes)"
 
     _print_result(fed_label, r_fed)
 
-    # ── centralized baseline ──────────────────────────────────────────────
+    # baseline centralizado com as mesmas features selecionadas
     clf_central = clone(base_clf)
     clf_central.fit(X_tr, y_tr)
     r_central = evaluate_model(clf_central, X_te, y_te, clf_ext.get_classifier_name())
-    _print_result(f"CENTRALIZADO — {clf_ext.get_classifier_name()}", r_central)
+    _print_result(f"CENTRALIZADO-SF — {clf_ext.get_classifier_name()}", r_central)
 
     # ── delta ─────────────────────────────────────────────────────────────
     print(f"\n{'='*60}")
